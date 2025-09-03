@@ -510,14 +510,55 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def parse_timestamp(timestamp):
-    """Parse timestamp string to seconds"""
+    """Parse timestamp string to seconds with strict format validation"""
     parts = timestamp.strip().split(':')
-    if len(parts) == 2:  # mm:ss
-        return int(parts[0]) * 60 + int(parts[1])
-    elif len(parts) == 3:  # hh:mm:ss
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    
+    if len(parts) == 2:  # mm:ss format
+        # Check format: each part must be at least 2 digits for seconds
+        if len(parts[1]) < 2:
+            raise ValueError(f"Invalid timestamp format: {timestamp} - seconds must be two digits (e.g., '30:01' not '30:1')")
+        
+        try:
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+        except ValueError:
+            raise ValueError(f"Invalid timestamp format: {timestamp} - must be numeric")
+        
+        # Validate ranges
+        if minutes < 0:
+            raise ValueError(f"Invalid timestamp: {timestamp} - minutes cannot be negative")
+        if seconds < 0 or seconds >= 60:
+            raise ValueError(f"Invalid timestamp: {timestamp} - seconds must be between 0-59")
+        
+        return minutes * 60 + seconds
+    
+    elif len(parts) == 3:  # hh:mm:ss format
+        # Check format: minutes and seconds must be 2 digits
+        if len(parts[1]) < 2:
+            raise ValueError(f"Invalid timestamp format: {timestamp} - minutes must be two digits (e.g., '1:05:30' not '1:5:30')")
+        if len(parts[2]) < 2:
+            raise ValueError(f"Invalid timestamp format: {timestamp} - seconds must be two digits (e.g., '1:30:05' not '1:30:5')")
+        
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+        except ValueError:
+            raise ValueError(f"Invalid timestamp format: {timestamp} - must be numeric")
+        
+        # Validate ranges
+        if hours < 0:
+            raise ValueError(f"Invalid timestamp: {timestamp} - hours cannot be negative")
+        if minutes < 0 or minutes >= 60:
+            raise ValueError(f"Invalid timestamp: {timestamp} - minutes must be between 0-59")
+        if seconds < 0 or seconds >= 60:
+            raise ValueError(f"Invalid timestamp: {timestamp} - seconds must be between 0-59")
+        
+        return hours * 3600 + minutes * 60 + seconds
+    
     else:
-        raise ValueError(f"Invalid timestamp format: {timestamp}")
+        raise ValueError(f"Invalid timestamp format: {timestamp} - must be mm:ss or hh:mm:ss")
+
 
 def parse_timestamp_ranges(timestamps_text):
     """Parse comma-separated timestamp ranges"""
