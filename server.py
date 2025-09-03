@@ -302,7 +302,7 @@ HTML_TEMPLATE = '''
                 <label for="outputPath">Save Location:</label>
                 <input type="text" id="outputPath" name="outputPath" placeholder="e.g., /Users/username/Desktop/clips or C:\Videos\clips">
                 <div class="example">
-                    Enter a folder path where clips will be saved (auto-filled with source folder)
+                    Enter the folder path where clips will be saved.
                 </div>
             </div>
 
@@ -311,9 +311,8 @@ HTML_TEMPLATE = '''
                 <textarea id="timestamps" name="timestamps" placeholder="Enter timestamps..." required></textarea>
                 <div class="example">
                     Examples:<br>
-                    • 1:34:30-1:40:43, 40:43-45:00, 2:34-4:23<br>
-                    • 12:34-43:56 (single clip)<br>
-                    • 3:00-5:00, 10:15-12:30
+                    • 1:34:30 - 1:40:43, 40:43 - 45:00<br>
+                    • 12:34-43:56
                 </div>
             </div>
 
@@ -332,31 +331,21 @@ HTML_TEMPLATE = '''
         <div class="download-links" id="downloadLinks"></div>
     </div>
 
-    <div class="server-info">
-        Server: {{ server_address }}
-    </div>
-
     <script>
-        // Load saved output path from localStorage or set default based on OS
+        // Set default output path based on OS
         window.addEventListener('load', function() {
             const outputPathField = document.getElementById('outputPath');
-            const savedPath = localStorage.getItem('videoSplitterOutputPath');
             
-            if (savedPath) {
-                // Use saved path if available
-                outputPathField.value = savedPath;
+            // Set default path based on OS
+            if (navigator.platform.includes('Mac')) {
+                // macOS default
+                outputPathField.value = '/Volumes/Share/Akampitha/Shortclips';
+            } else if (navigator.platform.includes('Win')) {
+                // Windows default
+                outputPathField.value = '\\\\Arana\\Share\\Akampitha\\Shortclips';
             } else {
-                // Set default path based on OS
-                if (navigator.platform.includes('Mac')) {
-                    // macOS default
-                    outputPathField.value = '/Volumes/Share/Akampitha/Rough Edits';
-                } else if (navigator.platform.includes('Win')) {
-                    // Windows default
-                    outputPathField.value = '\\\\Arana\\Share\\Akampitha\\Rough Edits';
-                } else {
-                    // Linux or other OS - leave empty
-                    outputPathField.placeholder = 'Enter folder path for clips';
-                }
+                // Linux or other OS - leave empty
+                outputPathField.placeholder = 'Enter folder path for clips';
             }
         });
 
@@ -410,9 +399,6 @@ HTML_TEMPLATE = '''
                 showStatus('Please specify a save location for the clips.', 'error');
                 return;
             }
-            
-            // Save the output path to localStorage for next time
-            localStorage.setItem('videoSplitterOutputPath', outputPath);
             
             const formData = new FormData();
             formData.append('video', file);
@@ -561,9 +547,21 @@ def parse_timestamp_ranges(timestamps_text):
     return ranges
 
 def get_first_word(filename):
-    """Get first word from filename"""
+    """Get first word from filename - works with Unicode"""
+    # Remove file extension
     name_without_ext = os.path.splitext(filename)[0]
-    return re.split(r'[\s\-_]+', name_without_ext)[0]
+    
+    # Split on space first (most common)
+    if ' ' in name_without_ext:
+        return name_without_ext.split(' ')[0]
+    
+    # Try other delimiters
+    for delimiter in ['_', '-', '.']:
+        if delimiter in name_without_ext:
+            return name_without_ext.split(delimiter)[0]
+    
+    # No delimiter found, return whole name
+    return name_without_ext if name_without_ext else "clip"
 
 # Store for temporary clip files
 temp_clips = {}
@@ -645,20 +643,25 @@ def split_video():
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
-        # Save uploaded file temporarily
-        filename = secure_filename(file.filename)
+        original_filename = file.filename  # Keep the original with Sinhala text
+        safe_filename = secure_filename(file.filename)  # For safe file operations, Save uploaded file temporarily
+
+        # If secure_filename stripped everything, use a generic name
+        if not safe_filename or safe_filename == '.mp4':
+            safe_filename = 'temp_video.mp4'
+
         temp_dir = tempfile.mkdtemp()
-        input_path = os.path.join(temp_dir, filename)
+        input_path = os.path.join(temp_dir, safe_filename)
         file.save(input_path)
         
         # Process video
         clips_info = []
-        first_word = get_first_word(filename)
+        first_word = get_first_word(original_filename)
         
         try:
-            for i, range_info in enumerate(ranges):
-                # Create output filename
-                output_filename = f"{first_word}-[{range_info['start_str'].replace(':', '')}-{range_info['end_str'].replace(':', '')}].mp4"
+            for i, range_info in enumerate(ranges, 1):  # Start counting from 1
+                # Create output filename with incremental number
+                output_filename = f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
                 
                 # Determine output path
                 if save_to_path:
@@ -823,5 +826,5 @@ if __name__ == '__main__':
     # Run the server
     # Using port 8080 to avoid conflicts with macOS services (AirPlay uses 5000)
     port = 8080
-    print(f"\n📌 Using port {port} (change if needed)")
+    print(f"\n🔌 Using port {port} (change if needed)")
     app.run(host='0.0.0.0', port=port, debug=False)
