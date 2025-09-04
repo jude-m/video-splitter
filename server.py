@@ -285,6 +285,16 @@ HTML_TEMPLATE = '''
             background: #f8d7da;
             color: #721c24;
         }
+
+        .debug-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 5px;
+            font-size: 0.8em;
+            font-family: monospace;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -332,20 +342,13 @@ HTML_TEMPLATE = '''
     </div>
 
     <script>
-        // Set default output path based on OS
+        // Set default output path based on the SERVER's OS
         window.addEventListener('load', function() {
             const outputPathField = document.getElementById('outputPath');
-            
-            // Set default path based on OS
-            if (navigator.platform.includes('Mac')) {
-                // macOS default
-                outputPathField.value = '/Volumes/Share/Akampitha/Shortclips';
-            } else if (navigator.platform.includes('Win')) {
-                // Windows default
-                outputPathField.value = '\\\\Arana\\Share\\Akampitha\\Shortclips';
-            } else {
-                // Linux or other OS - leave empty
-                outputPathField.placeholder = 'Enter folder path for clips';
+            // This value is passed from the Python server
+            const serverDefaultPath = {{ default_path | safe }};
+            if (serverDefaultPath) {
+                outputPathField.value = serverDefaultPath;
             }
         });
 
@@ -400,6 +403,9 @@ HTML_TEMPLATE = '''
                 return;
             }
             
+            // Log the path being sent for debugging
+            console.log('Sending output path:', outputPath);
+            
             const formData = new FormData();
             formData.append('video', file);
             formData.append('timestamps', timestamps);
@@ -414,8 +420,8 @@ HTML_TEMPLATE = '''
             downloadLinks.style.display = 'none';
             downloadLinks.innerHTML = '';
             
-            updateProgress(20, 'Uploading video...');
-            showStatus('Uploading and processing video...', 'info');
+            updateProgress(20, '   ');
+            showStatus('Processing and saving video...', 'info');
             
             try {
                 const response = await fetch('/split', {
@@ -450,10 +456,15 @@ HTML_TEMPLATE = '''
                 } else {
                     showStatus(`Error: ${result.error}`, 'error');
                     updateProgress(0, '');
+                    console.error('Server error:', result.error);
+                    if (result.details) {
+                        console.error('Error details:', result.details);
+                    }
                 }
             } catch (error) {
                 showStatus(`Error: ${error.message}`, 'error');
                 updateProgress(0, '');
+                console.error('Request error:', error);
             } finally {
                 splitBtn.disabled = false;
                 splitBtn.textContent = '🔪 Split Video';
@@ -476,6 +487,9 @@ def check_ffmpeg():
         return result.returncode == 0, ffmpeg_cmd
     except FileNotFoundError:
         return False, None
+    except Exception as e:
+        logger.error(f"Error checking ffmpeg: {str(e)}")
+        return False, None
 
 def get_ffmpeg_command():
     """Get the appropriate ffmpeg command for the OS"""
@@ -490,17 +504,20 @@ def get_ffmpeg_command():
         
         for path in possible_paths:
             if os.path.exists(path):
+                logger.info(f"Found ffmpeg at: {path}")
                 return path
             try:
                 result = subprocess.run([path, '-version'], 
                                       capture_output=True, 
                                       check=False)
                 if result.returncode == 0:
+                    logger.info(f"FFmpeg works at: {path}")
                     return path
             except:
                 continue
         
         # Fallback to hoping it's in PATH
+        logger.warning("FFmpeg not found in common locations, trying PATH")
         return 'ffmpeg.exe'
     else:
         return 'ffmpeg'
@@ -610,19 +627,16 @@ temp_clips = {}
 @app.route('/')
 def index():
     """Serve the main HTML page"""
-    import socket
-    hostname = socket.gethostname()
-    try:
-        # Get actual IP address
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except:
-        local_ip = socket.gethostbyname(hostname)
+    # Determine the default path based on the SERVER's operating system
+    default_path = ""
+    if platform.system() == "Windows":
+        # Use a raw string to correctly handle backslashes for the UNC path
+        default_path = r'\\Arana\Share\Akampitha\Shortclips'
+    elif platform.system() == "Darwin": # macOS
+        default_path = '/Volumes/Share/Akampitha/Shortclips'
     
-    server_address = f"{local_ip}:8080"
-    return render_template_string(HTML_TEMPLATE, server_address=server_address)
+    # Pass the correctly formatted path to the template
+    return render_template_string(HTML_TEMPLATE, default_path=json.dumps(default_path))
 
 @app.route('/check-ffmpeg')
 def check_ffmpeg_route():
@@ -640,9 +654,30 @@ def check_ffmpeg_route():
 @app.route('/split', methods=['POST'])
 def split_video():
     """Handle video splitting using ffmpeg directly"""
+
     try:
         # Check if ffmpeg is available
         ffmpeg_cmd = get_ffmpeg_command()
+        logger.info(f"Using ffmpeg command: {ffmpeg_cmd}")
+        
+        # Test ffmpeg is actually available
+        # try:
+        #     test_result = subprocess.run([ffmpeg_cmd, '-version'], 
+        #                                capture_output=True, 
+        #                                text=True, 
+        #                                check=False)
+        #     if test_result.returncode != 0:
+        #         raise Exception("FFmpeg is not working properly")
+        # except FileNotFoundError:
+        #     return jsonify({
+        #         'error': 'FFmpeg not found. Please install FFmpeg first.',
+        #         'details': 'Visit https://ffmpeg.org/download.html for installation instructions'
+        #     }), 500
+        # except Exception as e:
+        #     return jsonify({
+        #         'error': f'FFmpeg error: {str(e)}',
+        #         'details': 'Make sure FFmpeg is properly installed'
+        #     }), 500
         
         # Check if video file was uploaded
         if 'video' not in request.files:
@@ -662,21 +697,44 @@ def split_video():
         
         # Get output path (optional)
         output_path = request.form.get('outputPath', '').strip()
+        logger.info(f"Received output path: '{output_path}'")
         save_to_path = False
         
         # Validate output path if provided
         if output_path:
-            output_path = os.path.expanduser(output_path)  # Expand ~ to home directory
-            if not os.path.exists(output_path):
+            # Handle UNC paths on Windows
+            if platform.system() == 'Windows' and output_path.startswith('\\\\'):
+                # UNC path - leave as is
+                logger.info(f"UNC path detected: {output_path}")
+                # Try to check if the path exists
                 try:
-                    os.makedirs(output_path, exist_ok=True)
+                    # Try to access the network path
+                    if not os.path.exists(output_path):
+                        # Try to create the directory
+                        os.makedirs(output_path, exist_ok=True)
                     save_to_path = True
                 except Exception as e:
-                    return jsonify({'error': f'Cannot create output directory: {str(e)}'}), 400
-            elif not os.path.isdir(output_path):
-                return jsonify({'error': 'Output path must be a directory'}), 400
+                    logger.error(f"Cannot access network path: {e}")
+                    return jsonify({
+                        'error': f'Cannot access network path: {output_path}',
+                        'details': str(e)
+                    }), 400
             else:
-                save_to_path = True
+                # Regular path
+                output_path = os.path.expanduser(output_path)  # Expand ~ to home directory
+                if not os.path.exists(output_path):
+                    try:
+                        os.makedirs(output_path, exist_ok=True)
+                        save_to_path = True
+                    except Exception as e:
+                        return jsonify({
+                            'error': f'Cannot create output directory: {str(e)}',
+                            'details': f'Path: {output_path}'
+                        }), 400
+                elif not os.path.isdir(output_path):
+                    return jsonify({'error': 'Output path must be a directory'}), 400
+                else:
+                    save_to_path = True
         
         # Parse timestamps
         try:
@@ -685,15 +743,28 @@ def split_video():
             return jsonify({'error': str(e)}), 400
         
         original_filename = file.filename  # Keep the original with Sinhala text
-        safe_filename = secure_filename(file.filename)  # For safe file operations, Save uploaded file temporarily
+        safe_filename = secure_filename(file.filename)  # For safe file operations
 
         # If secure_filename stripped everything, use a generic name
         if not safe_filename or safe_filename == '.mp4':
             safe_filename = 'temp_video.mp4'
 
+        originals_dir = r"\\arana\share\akampitha\originals"
+        originals_path = originals_dir + "\\" + original_filename
+
+        logger.info(f"originals_path: {originals_path}")
+        
         temp_dir = tempfile.mkdtemp()
-        input_path = os.path.join(temp_dir, safe_filename)
-        file.save(input_path)
+
+        if os.path.exists(originals_path):
+            # File already exists on the share → use it directly
+            input_path = originals_path
+            logger.info(f"Using existing original file: {input_path}")
+        else:
+            # save file to a temp directory
+            input_path = os.path.join(temp_dir, safe_filename)
+            file.save(input_path)
+            logger.info(f"Video saved to temp location: {input_path}")
         
         # Process video
         clips_info = []
@@ -708,6 +779,7 @@ def split_video():
                 if save_to_path:
                     # Save directly to user-specified path
                     clip_output_path = os.path.join(output_path, output_filename)
+                    logger.info(f"Saving clip to: {clip_output_path}")
                 else:
                     # Save to temp directory for download
                     clip_output_path = os.path.join(temp_dir, output_filename)
@@ -729,25 +801,37 @@ def split_video():
                 
                 # Run ffmpeg
                 logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                # Fix Unicode encoding issue by specifying encoding and error handling
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True,
+                    encoding='utf-8',  # Use UTF-8 encoding
+                    errors='replace'   # Replace problematic characters instead of crashing
+                )
                 
                 if result.returncode != 0:
-                    logger.error(f"FFmpeg error: {result.stderr}")
-                    # Try again with re-encoding if copy failed
-                    cmd = [
-                        ffmpeg_cmd,
-                        '-i', input_path,
-                        '-ss', str(range_info['start']),
-                        '-t', str(duration),
-                        '-c:v', 'libx264',
-                        '-c:a', 'aac',
-                        '-y',
-                        clip_output_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    
-                    if result.returncode != 0:
+                        logger.error(f"FFmpeg stderr: {result.stderr}")
                         raise Exception(f"FFmpeg failed: {result.stderr}")
+                
+                # if result.returncode != 0:
+                #     logger.error(f"FFmpeg error: {result.stderr}")
+                #     # Try again with re-encoding if copy failed
+                #     cmd = [
+                #         ffmpeg_cmd,
+                #         '-i', input_path,
+                #         '-ss', str(range_info['start']),
+                #         '-t', str(duration),
+                #         '-c:v', 'libx264',
+                #         '-c:a', 'aac',
+                #         '-y',
+                #         clip_output_path
+                #     ]
+                #     result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                #     if result.returncode != 0:
+                #         raise Exception(f"FFmpeg failed: {result.stderr}")
                 
                 # Store clip info only if not saving to path (for download)
                 if not save_to_path:
@@ -788,7 +872,10 @@ def split_video():
         
     except Exception as e:
         logger.error(f"Error splitting video: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': str(e),
+            'details': 'Check server logs for more information'
+        }), 500
 
 @app.route('/download/<clip_id>')
 def download_clip(clip_id):
