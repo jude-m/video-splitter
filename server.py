@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import platform
 from pathlib import Path
+import threading
 from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
 import logging
@@ -407,7 +408,7 @@ HTML_TEMPLATE = '''
             console.log('Sending output path:', outputPath);
             
             const formData = new FormData();
-            formData.append('video', file);
+            formData.append('videoFilename', file.name);
             formData.append('timestamps', timestamps);
             formData.append('outputPath', outputPath);
             
@@ -421,7 +422,7 @@ HTML_TEMPLATE = '''
             downloadLinks.innerHTML = '';
             
             updateProgress(20, '   ');
-            showStatus('Processing and saving video...', 'info');
+            showStatus('Initiating job...', 'info');
             
             try {
                 const response = await fetch('/split', {
@@ -432,10 +433,10 @@ HTML_TEMPLATE = '''
                 const result = await response.json();
                 
                 if (response.ok) {
-                    updateProgress(100, 'Complete!');
+                    updateProgress(100, 'Processing started!');
                     
                     if (result.saved_to_path) {
-                        showStatus(`Successfully saved ${result.clips.length} video clip(s) to: ${result.saved_to_path}`, 'success');
+                        showStatus(`${result.clips.length} video clip(s) will be saved to: ${result.saved_to_path}`, 'success');
                         // Don't show download links if saved to path
                     } else {
                         showStatus(`Successfully created ${result.clips.length} video clip(s)!`, 'success');
@@ -658,36 +659,13 @@ def split_video():
     try:
         # Check if ffmpeg is available
         ffmpeg_cmd = get_ffmpeg_command()
-        logger.info(f"Using ffmpeg command: {ffmpeg_cmd}")
+        logger.info(f"Using ffmpeg command: {ffmpeg_cmd}")        
         
-        # Test ffmpeg is actually available
-        # try:
-        #     test_result = subprocess.run([ffmpeg_cmd, '-version'], 
-        #                                capture_output=True, 
-        #                                text=True, 
-        #                                check=False)
-        #     if test_result.returncode != 0:
-        #         raise Exception("FFmpeg is not working properly")
-        # except FileNotFoundError:
-        #     return jsonify({
-        #         'error': 'FFmpeg not found. Please install FFmpeg first.',
-        #         'details': 'Visit https://ffmpeg.org/download.html for installation instructions'
-        #     }), 500
-        # except Exception as e:
-        #     return jsonify({
-        #         'error': f'FFmpeg error: {str(e)}',
-        #         'details': 'Make sure FFmpeg is properly installed'
-        #     }), 500
-        
-        # Check if video file was uploaded
-        if 'video' not in request.files:
-            return jsonify({'error': 'No video file provided'}), 400
-        
-        file = request.files['video']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        if not allowed_file(file.filename):
+        original_filename = request.form.get('videoFilename', '').strip()
+        if not original_filename:
+            return jsonify({'error': 'No video filename provided'}), 400
+
+        if not allowed_file(original_filename):
             return jsonify({'error': 'Invalid file type. Allowed types: ' + ', '.join(ALLOWED_EXTENSIONS)}), 400
         
         # Get timestamps
@@ -697,8 +675,9 @@ def split_video():
         
         # Get output path (optional)
         output_path = request.form.get('outputPath', '').strip()
-        logger.info(f"Received output path: '{output_path}'")
-        save_to_path = False
+
+        if not output_path:
+            return jsonify({'error': 'No output path provided'}), 400
         
         # Validate output path if provided
         if output_path:
@@ -712,7 +691,6 @@ def split_video():
                     if not os.path.exists(output_path):
                         # Try to create the directory
                         os.makedirs(output_path, exist_ok=True)
-                    save_to_path = True
                 except Exception as e:
                     logger.error(f"Cannot access network path: {e}")
                     return jsonify({
@@ -725,7 +703,6 @@ def split_video():
                 if not os.path.exists(output_path):
                     try:
                         os.makedirs(output_path, exist_ok=True)
-                        save_to_path = True
                     except Exception as e:
                         return jsonify({
                             'error': f'Cannot create output directory: {str(e)}',
@@ -733,8 +710,6 @@ def split_video():
                         }), 400
                 elif not os.path.isdir(output_path):
                     return jsonify({'error': 'Output path must be a directory'}), 400
-                else:
-                    save_to_path = True
         
         # Parse timestamps
         try:
@@ -742,140 +717,90 @@ def split_video():
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
-        original_filename = file.filename  # Keep the original with Sinhala text
-        safe_filename = secure_filename(file.filename)  # For safe file operations
-
-        # If secure_filename stripped everything, use a generic name
-        if not safe_filename or safe_filename == '.mp4':
-            safe_filename = 'temp_video.mp4'
-
         originals_dir = r"\\arana\share\akampitha\originals"
         originals_path = originals_dir + "\\" + original_filename
-
         logger.info(f"originals_path: {originals_path}")
         
-        temp_dir = tempfile.mkdtemp()
-
         if os.path.exists(originals_path):
             # File already exists on the share → use it directly
             input_path = originals_path
             logger.info(f"Using existing original file: {input_path}")
         else:
-            # save file to a temp directory
-            input_path = os.path.join(temp_dir, safe_filename)
-            file.save(input_path)
-            logger.info(f"Video saved to temp location: {input_path}")
+            return jsonify({'error': 'Cannot find original video file'}), 400
         
-        # Process video
-        clips_info = []
         first_word = get_first_word(original_filename)
-        
-        try:
-            for i, range_info in enumerate(ranges, 1):  # Start counting from 1
-                # Create output filename with incremental number
-                output_filename = f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
-                
-                # Determine output path
-                if save_to_path:
-                    # Save directly to user-specified path
-                    clip_output_path = os.path.join(output_path, output_filename)
-                    logger.info(f"Saving clip to: {clip_output_path}")
-                else:
-                    # Save to temp directory for download
-                    clip_output_path = os.path.join(temp_dir, output_filename)
-                
-                # Calculate duration
-                duration = range_info['end'] - range_info['start']
-                
-                # Build ffmpeg command
-                cmd = [
-                    ffmpeg_cmd,
-                    '-i', input_path,
-                    '-ss', str(range_info['start']),
-                    '-t', str(duration),
-                    '-c', 'copy',  # Copy codecs (no re-encoding for speed)
-                    '-avoid_negative_ts', 'make_zero',
-                    '-y',  # Overwrite output file
-                    clip_output_path
-                ]
-                
-                # Run ffmpeg
-                logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
 
-                # Fix Unicode encoding issue by specifying encoding and error handling
-                result = subprocess.run(
-                    cmd, 
-                    capture_output=True, 
-                    text=True,
-                    encoding='utf-8',  # Use UTF-8 encoding
-                    errors='replace'   # Replace problematic characters instead of crashing
-                )
-                
-                if result.returncode != 0:
-                        logger.error(f"FFmpeg stderr: {result.stderr}")
-                        raise Exception(f"FFmpeg failed: {result.stderr}")
-                
-                # if result.returncode != 0:
-                #     logger.error(f"FFmpeg error: {result.stderr}")
-                #     # Try again with re-encoding if copy failed
-                #     cmd = [
-                #         ffmpeg_cmd,
-                #         '-i', input_path,
-                #         '-ss', str(range_info['start']),
-                #         '-t', str(duration),
-                #         '-c:v', 'libx264',
-                #         '-c:a', 'aac',
-                #         '-y',
-                #         clip_output_path
-                #     ]
-                #     result = subprocess.run(cmd, capture_output=True, text=True)
-                    
-                #     if result.returncode != 0:
-                #         raise Exception(f"FFmpeg failed: {result.stderr}")
-                
-                # Store clip info only if not saving to path (for download)
-                if not save_to_path:
-                    clip_id = f"clip_{i}_{os.urandom(8).hex()}"
-                    temp_clips[clip_id] = {
-                        'path': clip_output_path,
-                        'filename': output_filename,
-                        'temp_dir': temp_dir
-                    }
-                    
-                    clips_info.append({
-                        'id': clip_id,
-                        'filename': output_filename
-                    })
-                else:
-                    clips_info.append({
-                        'filename': output_filename
-                    })
+        # Start async processing in a background thread
+        thread = threading.Thread(
+            target=process_video_async,
+            args=(ffmpeg_cmd, first_word, input_path, output_path, ranges)
+        )
+        thread.daemon = True  # Allow program to exit even if thread is running
+        thread.start()
+
+        clips_info = []
+
+        for i, range_info in enumerate(ranges, 1):
+            clips_info.append({
+                'filename': f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
+        })
             
-            # Clean up temp files if saved to path
-            if save_to_path:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return jsonify({
-                    'success': True,
-                    'clips': clips_info,
-                    'saved_to_path': output_path
-                })
-            else:
-                return jsonify({
-                    'success': True,
-                    'clips': clips_info
-                })
-            
-        except Exception as e:
-            # Clean up on error
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise
-        
+        return jsonify({
+            'success': True,
+            'clips': clips_info,
+            'saved_to_path': output_path
+        })    
     except Exception as e:
         logger.error(f"Error splitting video: {str(e)}")
         return jsonify({
             'error': str(e),
             'details': 'Check server logs for more information'
         }), 500
+
+def process_video_async(ffmpeg_cmd, first_word, input_path, output_path, ranges): 
+    """Process video asynchronously"""
+    try:
+        for i, range_info in enumerate(ranges, 1):  # Start counting from 1
+            # Create output filename with incremental number
+            output_filename = f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
+                
+            # Save directly to user-specified path
+            clip_output_path = os.path.join(output_path, output_filename)
+            logger.info(f"Saving clip to: {clip_output_path}")
+                
+            # Calculate duration
+            duration = range_info['end'] - range_info['start']
+                
+            # Build ffmpeg command
+            cmd = [
+                ffmpeg_cmd,
+                '-i', input_path,
+                '-ss', str(range_info['start']),
+                '-t', str(duration),
+                '-c', 'copy',  # Copy codecs (no re-encoding for speed)
+                '-avoid_negative_ts', 'make_zero',
+                '-y',  # Overwrite output file
+                clip_output_path
+            ]
+                
+            # Run ffmpeg
+            logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
+
+            # Fix Unicode encoding issue by specifying encoding and error handling
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True,
+                encoding='utf-8',  # Use UTF-8 encoding
+                errors='replace'   # Replace problematic characters instead of crashing
+            )
+                
+            if result.returncode != 0:
+                    logger.error(f"FFmpeg stderr: {result.stderr}")
+                    raise Exception(f"FFmpeg failed: {result.stderr}")
+                
+    except Exception as e:
+        logger.error(f"Error splitting video: {str(e)}")
 
 @app.route('/download/<clip_id>')
 def download_clip(clip_id):
