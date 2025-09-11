@@ -318,11 +318,11 @@ HTML_TEMPLATE = '''
             </div>
 
             <div class="form-group">
-                <label for="timestamps">Timestamps (comma-separated):</label>
-                <textarea id="timestamps" name="timestamps" placeholder="Enter timestamps..." required></textarea>
+                <label for="Title & Timestamps">Title & Timestamps (comma-separated):</label>
+                <textarea id="timestamps" name="timestamps" placeholder="Enter splitting details..." required></textarea>
                 <div class="example">
                     Examples:<br>
-                    • 1:34:30 - 1:40:43, 40:43 - 45:00<br>
+                    • අවිද්‍යා කිලෝ එක 1:34:30 - 1:40:43, මෝහක්ඛයෝ 40:43 - 45:00, ...<br>
                     • 12:34-43:56
                 </div>
             </div>
@@ -527,6 +527,28 @@ def allowed_file(filename):
     """Check if file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def extract_title_and_timestamp(text):
+    """Extract title (if present) and timestamp from a string"""
+    # Pattern to match timestamp formats (HH:MM:SS, MM:SS, or SS)
+    # This pattern matches:
+    # - HH:MM:SS (e.g., 1:34:30)
+    # - MM:SS (e.g., 40:43)
+    # - Plain numbers (e.g., 45:00 or just 45)
+    timestamp_pattern = r'\d{1,2}:\d{1,2}:\d{1,2}|\d{1,2}:\d{1,2}'
+    
+    # Find the first timestamp in the string
+    match = re.search(timestamp_pattern, text)
+    
+    if match:
+        timestamp_start = match.start()
+        # Everything before the timestamp is the title
+        title = text[:timestamp_start].strip()
+        timestamp = text[timestamp_start:].strip()
+        return title if title else None, timestamp
+    else:
+        # No timestamp found, treat entire string as timestamp
+        return None, text.strip()
+    
 def parse_timestamp(timestamp):
     """Parse timestamp string to seconds with strict format validation"""
     parts = timestamp.strip().split(':')
@@ -578,32 +600,35 @@ def parse_timestamp(timestamp):
         raise ValueError(f"Invalid timestamp format: {timestamp} - must be mm:ss or hh:mm:ss")
 
 
-def parse_timestamp_ranges(timestamps_text):
+def parse_title_and_timestamp_ranges(timestamps_text):
     """Parse comma-separated timestamp ranges"""
-    ranges = []
+    meta_data = []
     for range_str in timestamps_text.split(','):
         range_str = range_str.strip()
         if not range_str:
             continue
         
-        parts = range_str.split('-')
+        title, range_without_title = extract_title_and_timestamp(range_str)
+        
+        parts = range_without_title.split('-')
         if len(parts) != 2:
-            raise ValueError(f"Invalid range format: {range_str}")
+            raise ValueError(f"Invalid range format: {range_without_title}")
         
         start = parse_timestamp(parts[0].strip())
         end = parse_timestamp(parts[1].strip())
         
         if start >= end:
-            raise ValueError(f"Invalid range: start time must be before end time in {range_str}")
+            raise ValueError(f"Invalid range: start time must be before end time in {range_without_title}")
         
-        ranges.append({
+        meta_data.append({
             'start': start,
             'end': end,
             'start_str': parts[0].strip(),
-            'end_str': parts[1].strip()
+            'end_str': parts[1].strip(),
+            'title': title[:35] if title else "No Name"  # Limit to 35 characters, None if no title
         })
     
-    return ranges
+    return meta_data
 
 def get_first_word(filename):
     """Get first word from filename - works with Unicode"""
@@ -668,7 +693,7 @@ def split_video():
         if not allowed_file(original_filename):
             return jsonify({'error': 'Invalid file type. Allowed types: ' + ', '.join(ALLOWED_EXTENSIONS)}), 400
         
-        # Get timestamps
+        # Get timestamps 
         timestamps = request.form.get('timestamps', '')
         if not timestamps:
             return jsonify({'error': 'No timestamps provided'}), 400
@@ -711,9 +736,9 @@ def split_video():
                 elif not os.path.isdir(output_path):
                     return jsonify({'error': 'Output path must be a directory'}), 400
         
-        # Parse timestamps
+        # Parse timestamps with title
         try:
-            ranges = parse_timestamp_ranges(timestamps)
+            title_and_ranges = parse_title_and_timestamp_ranges(timestamps)
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         
@@ -727,22 +752,30 @@ def split_video():
             logger.info(f"Using existing original file: {input_path}")
         else:
             return jsonify({'error': 'Cannot find original video file'}), 400
-        
-        first_word = get_first_word(original_filename)
+
+        try:
+            # Create a parent directory for the output files
+            folder_name = Path(original_filename).stem # Remove file extension from the filename
+            new_output_path = Path(output_path) / folder_name
+            new_output_path.mkdir(parents=True, exist_ok=True)
+            new_output_path = str(new_output_path)  
+        except OSError as e:
+            logger.error(f"Failed to create directory for {original_filename}: {e}")
+            return jsonify({'error': f'Failed to create output directory: {str(e)}'}), 500
 
         # Start async processing in a background thread
         thread = threading.Thread(
             target=process_video_async,
-            args=(ffmpeg_cmd, first_word, input_path, output_path, ranges)
+            args=(ffmpeg_cmd, input_path, new_output_path, title_and_ranges)
         )
         thread.daemon = True  # Allow program to exit even if thread is running
         thread.start()
 
         clips_info = []
 
-        for i, range_info in enumerate(ranges, 1):
+        for i, range_info in enumerate(title_and_ranges, 1):
             clips_info.append({
-                'filename': f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
+                'filename': f"{range_info['title']}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
         })
             
         return jsonify({
@@ -757,25 +790,25 @@ def split_video():
             'details': 'Check server logs for more information'
         }), 500
 
-def process_video_async(ffmpeg_cmd, first_word, input_path, output_path, ranges): 
+def process_video_async(ffmpeg_cmd, input_path, output_path, title_ranges): 
     """Process video asynchronously"""
     try:
-        for i, range_info in enumerate(ranges, 1):  # Start counting from 1
+        for i, title_range_info in enumerate(title_ranges, 1):  # Start counting from 1
             # Create output filename with incremental number
-            output_filename = f"{first_word}-{i}-[{range_info['start_str'].replace(':', '_')} - {range_info['end_str'].replace(':', '_')}].mp4"
+            output_filename = f"{i}-{title_range_info['title']}-[{title_range_info['start_str'].replace(':', '_')} - {title_range_info['end_str'].replace(':', '_')}].mp4"
                 
             # Save directly to user-specified path
             clip_output_path = os.path.join(output_path, output_filename)
             logger.info(f"Saving clip to: {clip_output_path}")
                 
             # Calculate duration
-            duration = range_info['end'] - range_info['start']
+            duration = title_range_info['end'] - title_range_info['start']
                 
             # Build ffmpeg command
             cmd = [
                 ffmpeg_cmd,
                 '-i', input_path,
-                '-ss', str(range_info['start']),
+                '-ss', str(title_range_info['start']),
                 '-t', str(duration),
                 '-c', 'copy',  # Copy codecs (no re-encoding for speed)
                 '-avoid_negative_ts', 'make_zero',
